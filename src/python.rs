@@ -60,6 +60,32 @@ pub struct PythonSampler {
     sampler: SampleGenerator<3>,
 }
 
+fn compensate_momtrop_edge_weights(
+    loop_momenta: &Vec<Vector<f64, 3>>,
+    edge_data: &Vec<(f64, Vector<f64, 3>)>,
+    signature: &Vec<Vec<isize>>,
+    edge_weights: &Vec<f64>,
+    ) -> f64 {
+    let n_edges = edge_data.len();
+    let mut prop_factor = 1.0;
+
+    for i in 0..n_edges {
+        let (mass, shift) = edge_data[i];
+        let loop_momentum_iter = loop_momenta.clone()
+        .into_iter()
+        .zip(&signature[i])
+        .map( |(loop_momentum, sig)| 
+            &loop_momentum*(*sig as f64)
+        );
+        let mut momentum = shift;
+        for loop_momentum in loop_momentum_iter {
+            momentum += loop_momentum;
+        }
+        prop_factor *= (momentum.squared() + mass.powi(2)).powf(edge_weights[i])
+    }
+    prop_factor
+}
+
 #[pymethods]
 impl PythonSampler {
     #[new]
@@ -117,6 +143,74 @@ impl PythonSampler {
         };
 
         Ok(python_result)
+    }
+
+    #[pyo3(signature = (x_space_points, edge_data, settings, force_sector=None))]
+    pub fn sample_batch(
+        &self,
+        x_space_points: Vec<Vec<f64>>,
+        edge_data: PythonEdgeData,
+        settings: PythonSettings,
+        force_sector: Option<Vec<Vec<usize>>>,
+    ) -> PyResult<PythonTropicalSampleResultBatch> {
+        let edge_data_clean: Vec<(f64, Vector<f64, 3>)> = edge_data.data.clone()
+            .into_iter()
+            .map( |(optional_mass, shift)| {
+                if let Some(mass) = optional_mass {
+                    (mass, shift)
+                }else{
+                    (shift.zero(), shift)
+                }
+            }
+        ).collect();
+        let signature = &self.sampler.loop_signature;
+        let edge_weights: Vec<f64> = self.sampler.iter_edge_weights().collect();
+        if let Some(sectors) = force_sector {
+            let sectors_iter = sectors
+            .into_iter()
+            .map(|sec| sec);
+            let rust_result: Vec<TropicalSampleResult<f64, 3>> = x_space_points
+            .into_iter()
+            .zip(sectors_iter)
+            .map( |(x_point, force_sec)| {
+                let mut trop_res = self.sampler.generate_sample_from_x_space_point(
+                    &x_point, 
+                    edge_data.data.clone(), 
+                    &settings.settings, 
+                    Some(&force_sec)).unwrap();
+                trop_res.jacobian *= compensate_momtrop_edge_weights(
+                    &trop_res.loop_momenta, &edge_data_clean, signature, &edge_weights)
+                    *self.get_sector_prob(force_sec.clone()); 
+                trop_res}
+            ).collect();
+
+            let python_result = PythonTropicalSampleResultBatch {
+                result: rust_result
+            };
+
+            Ok(python_result)
+        } else {
+            let rust_result: Vec<TropicalSampleResult<f64, 3>> = x_space_points
+            .into_iter()
+            .map( |x_point| {
+                let mut trop_res = self.sampler.generate_sample_from_x_space_point(
+                    &x_point, 
+                    edge_data.data.clone(), 
+                    &settings.settings,
+                    None
+                ).unwrap();
+                trop_res.jacobian *= compensate_momtrop_edge_weights(
+                    &trop_res.loop_momenta, &edge_data_clean, signature, &edge_weights); 
+                trop_res}
+            ).collect();
+
+            let python_result = PythonTropicalSampleResultBatch {
+                result: rust_result
+            };
+
+            Ok(python_result)
+        }
+        
     }
 
     /// just for easy testing, should not be in final version
@@ -234,6 +328,22 @@ impl PythonVector {
             self.vector[0], self.vector[1], self.vector[2]
         ))
     }
+
+    fn x(&self) -> PyResult<impl IntoPyObject<'_>> {
+        Ok(self.vector[0])
+    }
+
+    fn y(&self) -> PyResult<impl IntoPyObject<'_>> {
+        Ok(self.vector[1])
+    }
+
+    fn z(&self) -> PyResult<impl IntoPyObject<'_>> {
+        Ok(self.vector[2])
+    }
+
+    fn to_list(&self) -> PyResult<impl IntoPyObject<'_>> {
+        Ok(self.vector.get_elements().to_vec())
+    }
 }
 
 #[pyclass(name = "TropicalSampleResult")]
@@ -257,6 +367,35 @@ impl PythonTropicalSampleResult {
     #[getter]
     fn get_jacobian(&self) -> f64 {
         self.result.jacobian
+    }
+}
+
+#[pyclass(name = "TropicalSampleResultBatch")]
+pub struct PythonTropicalSampleResultBatch {
+    result: Vec<TropicalSampleResult<f64, 3>>,
+}
+
+#[pymethods]
+impl PythonTropicalSampleResultBatch {
+    #[getter]
+    fn get_loop_momenta(&self) -> Vec<Vec<Vec<f64>>> {
+        self.result
+            .iter()
+            .map(|results| 
+                results.clone().loop_momenta.iter()
+                .map( |loop_momentum| 
+                loop_momentum.get_elements().to_vec()
+            ).collect()
+        ).collect()
+    }
+
+    #[getter]
+    fn get_jacobians(&self) -> Vec<f64> {
+        self.result
+            .iter()
+            .map( |res| 
+            res.jacobian
+        ).collect()
     }
 }
 

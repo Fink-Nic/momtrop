@@ -13,4 +13,4 @@ classifiers = [
 ]
 
 [tool.maturin]
-features = ["pyhon_api"]
+features = ["python_api"]
